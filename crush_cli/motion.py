@@ -7,26 +7,18 @@ import shutil
 import sys
 import threading
 import time
-import unicodedata
 from typing import TextIO
+
+from crush_cli.presentation import display_width, safe_text, wrap_lines
 
 
 FRAMES = ('·', '✦', '✧', '✶', '✧', '✦')
 INTERVAL = 0.1
 
 
-def display_width(text: str) -> int:
-    """Count terminal cells, including wide CJK and combining accents."""
-    return sum(
-        0 if unicodedata.combining(char) or unicodedata.category(char).startswith('C')
-        else 2 if unicodedata.east_asian_width(char) in ('W', 'F') else 1
-        for char in text
-    )
-
-
 def _label(text: str) -> str:
     # A stage must stay on one line and cannot inject terminal controls.
-    return ''.join(' ' if unicodedata.category(char).startswith('C') else char for char in text)
+    return safe_text(text).replace('\n', ' ')
 
 
 def _fit(text: str, cells: int) -> str:
@@ -82,7 +74,7 @@ class Spinner:
 
     def __enter__(self) -> Spinner:
         if not self.enabled:
-            self.stream.write(_label(self.label) + '\n')
+            self.stream.write('\n'.join(wrap_lines(_label(self.label), max(1, self._columns() - 1))) + '\n')
             self.stream.flush()
             return self
         self._stop.clear()

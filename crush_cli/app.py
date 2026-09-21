@@ -6,9 +6,10 @@ import json
 import os
 import random
 import re
+import select
 import shlex
+import shutil
 import sys
-import textwrap
 import threading
 import time
 from datetime import datetime
@@ -17,9 +18,12 @@ import base64
 from typing import Any, Dict, Iterable
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlparse, urlunparse
-from urllib.request import Request, urlopen
+from urllib.request import Request
+
+from crush_core.provider import ProviderError, urlopen
 
 from crush_cli.motion import Spinner
+from crush_cli.presentation import display_width, panel_lines, safe_text, terminal_width, wrap_lines
 
 try:
     import termios
@@ -325,27 +329,27 @@ class C:
     reset = "\033[0m"
     dim = "\033[2m"
     bold = "\033[1m"
-    rose = "\033[38;5;211m"
-    coral = "\033[38;5;203m"
-    cyan = "\033[38;5;81m"
-    gold = "\033[38;5;222m"
-    green = "\033[38;5;121m"
-    slate = "\033[38;5;110m"
-    red = "\033[38;5;210m"
+    rose = "\033[38;5;150m"
+    coral = "\033[38;5;180m"
+    cyan = "\033[38;5;151m"
+    gold = "\033[38;5;180m"
+    green = "\033[38;5;150m"
+    slate = "\033[38;5;250m"
+    red = "\033[38;5;174m"
 
 
 def color(text: str, code: str, enabled: bool = True) -> str:
-    enabled = enabled and "NO_COLOR" not in os.environ and os.environ.get("TERM", "").lower() != "dumb"
+    text = safe_text(text)
+    enabled = enabled and sys.stdout.isatty() and "NO_COLOR" not in os.environ and os.environ.get("TERM", "").lower() != "dumb"
     return f"{code}{text}{C.reset}" if enabled else text
 
 
 def visible_len(text: str) -> int:
-    import unicodedata
-    return sum(0 if unicodedata.combining(c) else 2 if unicodedata.east_asian_width(c) in {'W', 'F'} else 1 for c in text)
+    return display_width(safe_text(text))
 
 
 def wrap(text: str, width: int = 78) -> str:
-    return "\n".join(textwrap.wrap(text, width=width, replace_whitespace=False)) or text
+    return "\n".join(wrap_lines(text, min(width, terminal_width())))
 
 
 def tr(lang: str, key: str, **kwargs: Any) -> str:
@@ -368,12 +372,16 @@ def read_key() -> str:
     fd = sys.stdin.fileno()
     old = termios.tcgetattr(fd)
     try:
-        tty.setraw(fd)
-        ch = sys.stdin.read(1)
+        tty.setraw(fd, termios.TCSANOW)
+        ch = os.read(fd, 1).decode("ascii", errors="ignore")
+        if ch in {"\x03", "\x04", ""}:
+            raise KeyboardInterrupt
         if ch == "\x1b":
-            nxt = sys.stdin.read(1)
-            if nxt == "[":
-                return "\x1b[" + sys.stdin.read(1)
+            if not select.select([fd], [], [], 0.1)[0]:
+                return "\x1b"
+            nxt = os.read(fd, 1).decode("ascii", errors="ignore")
+            if nxt == "[" and select.select([fd], [], [], 0.1)[0]:
+                return "\x1b[" + os.read(fd, 1).decode("ascii", errors="ignore")
             return "\x1b"
         return ch
     finally:
@@ -381,53 +389,68 @@ def read_key() -> str:
 
 
 def choose_option(title: str, prompt: str, options: list[dict[str, str]], *, plain: bool, lang: str, selected: int = 0) -> dict[str, str]:
-    if plain or not supports_arrow_select():
-        print(color(f"\n{title}", C.bold, not plain))
-        print(color(prompt, C.cyan, not plain))
+    if not options:
+        raise ValueError("Choose from at least one option")
+    width = terminal_width()
+    index = max(0, min(selected, len(options) - 1))
+
+    def option_label(option: dict[str, str]) -> str:
+        label = option.get("name", "")
+        native = option.get("native", "")
+        return label + (f" · {native}" if native and native != label else "")
+
+    def numbered() -> dict[str, str]:
+        print(color("\n" + wrap(title), C.bold, not plain))
+        print(color(wrap(prompt), C.cyan, not plain))
         for i, option in enumerate(options, start=1):
-            detail = option.get("native") or option.get("name", "")
-            print(f"  {i}. {option.get('name', detail)}" + (f" · {detail}" if detail and detail != option.get("name") else ""))
-        print(color(tr(lang, "number_hint"), C.dim, not plain))
+            print(wrap(f"  {i}. {option_label(option)}"))
+        print(color(wrap(tr(lang, "number_hint")), C.dim, not plain))
         while True:
             raw = input("> ").strip()
             if raw.isdigit() and 1 <= int(raw) <= len(options):
                 return options[int(raw) - 1]
             print(color("Invalid selection.", C.red, not plain))
 
-    index = max(0, min(selected, len(options) - 1))
-    while True:
-        sys.stdout.write("\033[2J\033[H")
-        print(color(f"╭─ {title}", C.rose))
-        print(color(f"│ {prompt}", C.cyan))
-        print(color(f"│ {tr(lang, 'arrow_hint')}", C.dim))
-        print(color("╰" + "─" * 56, C.rose))
+    def rows() -> list[str]:
+        result = [color(line, C.rose) for line in panel_lines(title, [prompt, tr(lang, "arrow_hint")], width)]
         for i, option in enumerate(options):
-            pointer = "❯" if i == index else " "
-            marker = color(pointer, C.gold)
-            label = option.get("name", "")
-            native = option.get("native", "")
-            suffix = f" · {native}" if native and native != label else ""
-            print(f" {marker} {color(label + suffix, C.bold if i == index else C.slate)}")
+            lines = wrap_lines(option_label(option), max(1, width - 3))
+            for j, line in enumerate(lines):
+                marker = " › " if i == index and j == 0 else "   "
+                result.append(color(marker + line, C.bold if i == index else C.slate))
+        return result
+
+    if (plain or not supports_arrow_select() or os.environ.get("TERM", "").lower() == "dumb"
+            or os.environ.get("CRUSH_REDUCED_MOTION") == "1"
+            or len(rows()) >= shutil.get_terminal_size((80, 24)).lines):
+        return numbered()
+
+    previous_rows = 0
+    while True:
+        frame = rows()
+        # A resized terminal can reflow old rows; avoid erasing uncertain history.
+        if terminal_width() != width or len(frame) >= shutil.get_terminal_size((80, 24)).lines:
+            return numbered()
+        if previous_rows:
+            sys.stdout.write(f"\r\033[{previous_rows}A")
+        sys.stdout.write("".join("\r\033[2K" + line + "\n" for line in frame))
+        sys.stdout.flush()
+        previous_rows = len(frame)
         key = read_key()
         if key in {"\x1b[A", "k"}:
             index = (index - 1) % len(options)
         elif key in {"\x1b[B", "j"}:
             index = (index + 1) % len(options)
         elif key in {"\r", "\n"}:
-            sys.stdout.write("\033[2J\033[H")
             return options[index]
         elif key == "\x1b":
-            sys.stdout.write("\033[2J\033[H")
             raise KeyboardInterrupt
 
 
 def animated_panel(title: str, lines: list[str], *, plain: bool) -> None:
-    print(color(f"\n╭─ {title}", C.rose, not plain))
-    for line in lines:
-        print(color("│ ", C.rose, not plain) + line)
-        if not plain:
-            time.sleep(0.035)
-    print(color("╰" + "─" * 56, C.rose, not plain))
+    print()
+    for row in panel_lines(title, lines, terminal_width()):
+        print(color(row[:2], C.rose, not plain) + row[2:])
 
 
 class ModelError(RuntimeError):
@@ -521,6 +544,8 @@ class ChatClient:
             if self.provider_mode == "gemini":
                 return self._reply_gemini(runtime_prompt, user_message)
             return self._reply_openai(runtime_prompt, user_message)
+        except ProviderError as exc:
+            raise ModelError(str(exc)) from exc
         except (TimeoutError, KeyError, IndexError, TypeError, AttributeError, json.JSONDecodeError) as exc:
             raise ModelError("模型请求超时或返回格式无效，请重试。") from exc
 
@@ -551,8 +576,8 @@ class ChatClient:
         try:
             data = json.loads(urlopen(req, timeout=60).read().decode("utf-8"))
         except HTTPError as exc:
-            body = exc.read().decode("utf-8", errors="replace")
-            raise ModelError(_format_http_error(exc.code, self.api_base, self.model, body)) from exc
+            exc.close()
+            raise ModelError(_format_http_error(exc.code, self.api_base, self.model)) from exc
         except URLError as exc:
             raise ModelError(f"模型服务连接失败：{exc.reason}") from exc
         except json.JSONDecodeError as exc:
@@ -581,8 +606,8 @@ class ChatClient:
         try:
             data = json.loads(urlopen(req, timeout=60).read().decode("utf-8"))
         except HTTPError as exc:
-            body = exc.read().decode("utf-8", errors="replace")
-            raise ModelError(_format_http_error(exc.code, self.api_base, self.model, body)) from exc
+            exc.close()
+            raise ModelError(_format_http_error(exc.code, self.api_base, self.model)) from exc
         except URLError as exc:
             raise ModelError(f"模型服务连接失败：{exc.reason}") from exc
         content = data.get("content", [])
@@ -606,8 +631,8 @@ class ChatClient:
         try:
             data = json.loads(urlopen(req, timeout=60).read().decode("utf-8"))
         except HTTPError as exc:
-            body = exc.read().decode("utf-8", errors="replace")
-            raise ModelError(_format_http_error(exc.code, self.api_base, self.model, body)) from exc
+            exc.close()
+            raise ModelError(_format_http_error(exc.code, self.api_base, self.model)) from exc
         except URLError as exc:
             raise ModelError(f"模型服务连接失败：{exc.reason}") from exc
         candidates = data.get("candidates", [])
@@ -617,28 +642,15 @@ class ChatClient:
         return "".join(part.get("text", "") for part in parts if isinstance(part, dict)).strip()
 
 
-def _format_http_error(code: int, api_base: str, model: str, body: str) -> str:
-    detail = _extract_error_message(body)
+def _format_http_error(code: int, api_base: str, model: str, body: str = "") -> str:
+    # Provider error payloads may echo credentials, private chat, or ANSI controls.
     tips = {
         401: "API key 无效或权限不足。请重新运行 /setup 或 /config key <new_key>。",
         404: "接口地址或模型名可能不对。DeepSeek 请用 API base: https://api.deepseek.com。",
         429: "请求过多、额度不足或触发限流。可以稍后重试，或检查服务商余额/并发限制。",
     }
     tip = tips.get(code, "请检查 API base、model、key 和服务商状态。")
-    return f"模型服务返回 HTTP {code}。\nAPI base: {api_base}\nModel: {model}\n{tip}" + (f"\nProvider message: {detail}" if detail else "")
-
-
-def _extract_error_message(body: str) -> str:
-    if not body:
-        return ""
-    try:
-        data = json.loads(body)
-    except Exception:
-        return body[:500]
-    err = data.get("error", data)
-    if isinstance(err, dict):
-        return str(err.get("message") or err.get("detail") or err)[:500]
-    return str(err)[:500]
+    return f"模型服务返回 HTTP {code}。\n{tip}"
 
 
 class CrushCLI:
@@ -699,8 +711,6 @@ class CrushCLI:
             self.stop_timeline()
 
     def intro(self) -> None:
-        if not self.plain:
-            os.system("clear" if os.name != "nt" else "cls")
         logo = [
             "   ______                __        __   _ __ __",
             "  / ____/______  _______/ /_      / /__(_) // /",
@@ -708,15 +718,14 @@ class CrushCLI:
             "/ /___/ /  / /_/ (__  ) / / /   / ,< / /__  __/",
             "\\____/_/   \\__,_/____/_/ /_/   /_/|_/_/  /_/   ",
         ]
-        for i, line in enumerate(logo):
-            shade = [C.coral, C.rose, C.gold, C.cyan, C.slate][i]
-            print(color(line, shade, not self.plain))
-            if not self.plain:
-                time.sleep(0.035)
+        if self.plain or max(display_width(line) for line in logo) > terminal_width():
+            logo = wrap_lines("Crush.skill / v2", terminal_width())
+        for line in logo:
+            print(color(line, C.rose, not self.plain))
         print()
-        print(color(self.t("tagline"), C.bold, not self.plain))
-        print(color(self.t("memory", path=self.data_dir), C.dim, not self.plain))
-        print(color(self.t("hint"), C.dim, not self.plain))
+        print(color(wrap(self.t("tagline")), C.bold, not self.plain))
+        print(color(wrap(self.t("memory", path=self.data_dir)), C.dim, not self.plain))
+        print(color(wrap(self.t("hint")), C.dim, not self.plain))
 
     def ensure_session(self) -> None:
         session = self.runtime.memory.sqlite.load_session(self.session_id)
@@ -813,8 +822,17 @@ class CrushCLI:
             ("/quit", self.t("quit_cmd")),
         ]
         print(color(f"\n{self.t('commands')}", C.bold, not self.plain))
+        width = terminal_width()
         for name, desc in rows:
-            print(f"  {color(name.ljust(30), C.cyan, not self.plain)} {desc}")
+            if width >= 64:
+                for i, line in enumerate(wrap_lines(desc, width - 33)):
+                    label = name.ljust(30) if i == 0 else " " * 30
+                    print(f"  {color(label, C.cyan, not self.plain)} {line}")
+            else:
+                print(color(wrap(name), C.cyan, not self.plain))
+                for line in wrap_lines(desc, max(1, width - 2)):
+                    print("  " + line)
+                print()
 
     def setup(self) -> None:
         self.model_wizard(first_run=False)
@@ -996,15 +1014,18 @@ class CrushCLI:
         ctx = self.runtime.memory.sqlite.build_memory_context(self.session_id, query="emoji media image", limit=2)
         assets = ctx.get("media_assets", [])
         if not assets:
-            print(color("No imported media assets yet. Re-import with /import-weflow --full <file>.", C.dim, not self.plain))
+            print(color(wrap("No imported media assets yet. Re-import with /import-weflow --full <file>."), C.dim, not self.plain))
             return
-        print(color("\nMedia Assets", C.bold, not self.plain))
+        print(color("\n" + wrap("Media Assets"), C.bold, not self.plain))
         for item in assets[:12]:
             payload = item.get("payload", {})
             counts = payload.get("speakerCounts", {})
             key = payload.get("mediaKey") or payload.get("md5") or payload.get("artifactId")
             path = payload.get("localPath") or payload.get("cdnUrl") or ""
-            print(f"  {payload.get('kind', 'media'):6} {str(key)[:18]:18} target={counts.get('target', 0):3} me={counts.get('me', 0):3} {path}")
+            print(color(wrap(f"{payload.get('kind', 'media')} · {key}"), C.cyan, not self.plain))
+            print(wrap(f"target={counts.get('target', 0)} · me={counts.get('me', 0)}"))
+            if path:
+                print(wrap(path))
             if not self.plain:
                 self.render_media_ref(payload, preview_only=True)
 
@@ -1012,7 +1033,7 @@ class CrushCLI:
         result = self.runtime.run("list_sessions", self.session_id, {})
         for item in result["sessions"]:
             marker = "*" if item["session_id"] == self.session_id else " "
-            print(f"{marker} {item['session_id']}  {item['canonical_archetype']}  {item['updated_at']}")
+            print(wrap(f"{marker} {item['session_id']}  {item['canonical_archetype']}  {item['updated_at']}"))
 
     def use(self, args: list[str]) -> None:
         if not args:
@@ -1026,10 +1047,16 @@ class CrushCLI:
     def dashboard(self) -> None:
         result = self.runtime.run("dashboard", self.session_id, {})
         cards = result["dashboard"]["cards"]
-        print(color("\nRelationship State", C.bold, not self.plain))
+        print(color("\n" + wrap("Relationship State"), C.bold, not self.plain))
+        width = terminal_width()
         for key, value in cards.items():
-            bar = self.bar(float(value))
-            print(f"  {key.ljust(22)} {bar} {value}")
+            print(color(wrap(key), C.slate, not self.plain))
+            bar_width = min(24, width - display_width(str(value)) - 3)
+            if bar_width >= 4:
+                print(f"  {self.bar(float(value), bar_width)} {value}")
+            else:
+                print(wrap(str(value)))
+                print(self.bar(float(value), width))
 
     def postmortem(self) -> None:
         result = self.runtime.run("postmortem", self.session_id, {})
@@ -1415,9 +1442,11 @@ class CrushCLI:
         header = self.bubble_header("Ta", stamp)
         print(color(header, C.rose, not self.plain))
         display_reply, media_refs = self.extract_media_tokens(reply, turn)
-        for line in wrap(display_reply, width=76).splitlines():
-            print(color("│ ", C.rose, not self.plain) + line)
-        print(color("╰", C.rose, not self.plain))
+        prefix = "│ " if terminal_width() >= 12 else ""
+        for line in wrap_lines(display_reply, max(1, terminal_width() - display_width(prefix))):
+            print(color(prefix, C.rose, not self.plain) + line)
+        if prefix:
+            print(color("╰", C.rose, not self.plain))
         for ref in media_refs:
             self.render_media_ref(ref)
         vector = turn.get("relationship_vector", "")
@@ -1427,12 +1456,12 @@ class CrushCLI:
             flags = coach.get("warning_flags", [])
             flag_text = f" · {'/'.join(flags[:2])}" if flags else ""
             print(color(
-                f"{self.t('readout')}: {coach.get('line_type')} · {self.t('risk')} {coach.get('risk_level')} · {coach.get('should_flirt')}{flag_text}",
+                wrap(f"{self.t('readout')}: {coach.get('line_type')} · {self.t('risk')} {coach.get('risk_level')} · {coach.get('should_flirt')}{flag_text}"),
                 C.gold,
                 not self.plain,
             ))
-            print(color(f"{self.t('judgment')}: {coach.get('interest_read')}", C.dim, not self.plain))
-            print(color(f"{self.t('next_line')}: {coach.get('next_move')}", C.dim, not self.plain))
+            print(color(wrap(f"{self.t('judgment')}: {coach.get('interest_read')}"), C.dim, not self.plain))
+            print(color(wrap(f"{self.t('next_line')}: {coach.get('next_move')}"), C.dim, not self.plain))
             detail = " · ".join(
                 part
                 for part in [
@@ -1443,10 +1472,10 @@ class CrushCLI:
                 if part
             )
             if detail:
-                print(color(f"细节: {detail}", C.dim, not self.plain))
+                print(color(wrap(f"细节: {detail}"), C.dim, not self.plain))
         elif vector:
             short = f"{vector} · favorability {delta.get('favorability', 0):+} · defense {delta.get('defense_level', 0):+}"
-            print(color(short, C.dim, not self.plain))
+            print(color(wrap(short), C.dim, not self.plain))
 
     def adjust_coach_after_reply(self, turn: Dict[str, Any], reply: str) -> None:
         text = re.sub(r"\s+", "", reply.lower())
@@ -1496,22 +1525,23 @@ class CrushCLI:
         kind = media.get("kind", "media")
         label = media.get("mediaKey") or media.get("md5") or media.get("id") or kind
         inline_supported = os.environ.get("TERM_PROGRAM") in {"iTerm.app", "WezTerm"}
-        if path and Path(path).expanduser().exists() and not self.plain and inline_supported:
+        visual = not self.plain and sys.stdout.isatty() and "NO_COLOR" not in os.environ and os.environ.get("TERM", "").lower() != "dumb"
+        if visual and path and Path(path).expanduser().exists() and inline_supported:
             try:
                 data = Path(path).expanduser().read_bytes()
                 encoded = base64.b64encode(data).decode("ascii")
                 name = base64.b64encode(Path(path).name.encode("utf-8")).decode("ascii")
-                print(f"\033]1337;File=name={name};inline=1;width=auto;height=8;preserveAspectRatio=1:{encoded}\a")
-                print(color(f"[{kind}] {path}", C.dim, not self.plain))
+                print(f"\033]1337;File=name={name};inline=1;width={min(24, terminal_width())};height=8;preserveAspectRatio=1:{encoded}\a")
+                print(color(wrap(f"[{kind}] {path}"), C.dim, not self.plain))
                 return
             except Exception:
                 pass
-        if path and Path(path).expanduser().exists() and not self.plain:
+        if visual and path and Path(path).expanduser().exists():
             if self.render_ansi_image(Path(path).expanduser()):
-                print(color(f"[{kind}] {path}", C.dim, not self.plain))
+                print(color(wrap(f"[{kind}] {path}"), C.dim, not self.plain))
                 return
         if not preview_only:
-            print(color(f"[{kind}] {label}: {path or url or 'media asset not found locally'}", C.dim, not self.plain))
+            print(color(wrap(f"[{kind}] {label}: {path or url or 'media asset not found locally'}"), C.dim, not self.plain))
 
     def render_ansi_image(self, path: Path, width: int = 24) -> bool:
         try:
@@ -1522,7 +1552,7 @@ class CrushCLI:
                 w, h = frame.size
                 if w <= 0 or h <= 0:
                     return False
-                target_w = max(8, min(width, w))
+                target_w = max(1, min(width, w, terminal_width()))
                 # Two vertical pixels are packed into one terminal row.
                 target_h = max(2, int((h / w) * target_w * 0.5))
                 frame = frame.resize((target_w, target_h * 2))
@@ -1546,7 +1576,10 @@ class CrushCLI:
         return color("█" * filled, C.cyan, not self.plain) + color("░" * (width - filled), C.dim, not self.plain)
 
     def bubble_header(self, name: str, stamp: str, width: int = 78) -> str:
-        left = f"╭─ {name}"
+        width = min(width, terminal_width())
+        if width < 12:
+            return "\n".join(wrap_lines(f"{name}\n{stamp}", width))
+        left = "╭─ " + wrap_lines(name, max(1, width - display_width(stamp) - 4))[0]
         gap = max(1, width - visible_len(left) - visible_len(stamp))
         return left + " " * gap + stamp
 

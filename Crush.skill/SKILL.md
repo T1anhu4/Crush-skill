@@ -47,6 +47,18 @@ When the user invokes `/crush-distill`:
 
 Use `/crush-dashboard` and `/crush-postmortem` only when the user asks to inspect relationship mechanics. In ordinary chat, stay in character.
 
+### Presentation across hosts
+
+The host owns fonts, message bubbles and animation. Use its native rendering; do not emit ANSI escapes, ASCII-window frames, simulated typing, countdowns or repeated “thinking” updates. This skill cannot install a custom host UI.
+
+- **Conversation:** Show the character's reply as plain short paragraphs. Preserve meaningful line breaks; avoid a heading, avatar label, score table or coaching footer on every turn. Do not split one reply into many decorative fragments.
+- **Queued / paused / failed:** Show one concise status and one useful next step, separately from the character's speech. Technical failures are not rejection. For example: “消息已保存，模型连接失败。检查配置后可重试。” Use this only when the tool actually reports that state.
+- **New session / import:** Lead with the outcome and the next action. Keep the session ID on a secondary line for reuse. Do not dump all inferred traits or private source records by default.
+- **Requested dashboard / review:** Use short headings and readable lists; keep evidence next to each interpretation, including uncertainty. Avoid wide multi-column tables on chat surfaces. Full requested reports and their evidence must remain available, not silently truncated for aesthetics.
+- **Commands and diagnostics:** Put copyable commands in fenced code blocks. Raw JSON stays a machine interface and is shown only when explicitly requested; never mix decorative output into tool stdout.
+
+Do not invent delivery/read indicators, timestamps, character thoughts, memories or emotions to make the interface feel more alive. Display only states supported by the runtime.
+
 ## Slash Commands
 
 ### Explicit v3 preview adapter

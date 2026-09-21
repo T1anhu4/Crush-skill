@@ -10,6 +10,7 @@ import threading
 from urllib.parse import urlsplit
 
 from fastapi import FastAPI, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -19,6 +20,42 @@ from .engine import Engine
 from .provider import validate_base
 
 ROOT = Path(__file__).resolve().parents[1]
+# Room for 4,000 characters even when supplementary Unicode is JSON-escaped.
+MAX_REQUEST_BYTES = 65536
+
+
+class RequestBodyLimit:
+    """Bound actual API bytes before JSON parsing, including chunked requests."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope['type'] != 'http' or not scope['path'].startswith('/api/') or scope['method'] in {'GET', 'HEAD'}:
+            return await self.app(scope, receive, send)
+        body = bytearray()
+        while True:
+            message = await receive()
+            if message['type'] == 'http.disconnect':
+                return
+            chunk = message.get('body', b'')
+            if len(body) + len(chunk) > MAX_REQUEST_BYTES:
+                response = JSONResponse({'error': '请求过大。'}, status_code=413)
+                return await response(scope, receive, send)
+            body.extend(chunk)
+            if not message.get('more_body', False):
+                break
+
+        delivered = False
+
+        async def replay():
+            nonlocal delivered
+            if delivered:
+                return await receive()
+            delivered = True
+            return {'type': 'http.request', 'body': bytes(body), 'more_body': False}
+
+        return await self.app(scope, replay, send)
 
 
 class Settings:
@@ -33,14 +70,14 @@ class Settings:
             return json.loads(self.path.read_text())
 
     def save(self, data):
-        validate_base(data['base'])
+        data = dict(data, base=validate_base(data['base']))
         if not data['model'].strip():
             raise ValueError('请输入模型名。')
         with self.lock:
             previous = json.loads(self.path.read_text()) if self.path.exists() else {}
             if not data['key']:
                 # Never carry a key to another endpoint by accident.
-                data['key'] = previous.get('key','') if previous.get('base')==data['base'] else ''
+                data['key'] = previous.get('key','') if previous.get('base','').rstrip('/')==data['base'] else ''
             if not data['key']:
                 raise ValueError('请输入此服务的 API Key；本地无鉴权服务可填 local。')
             self.path.parent.mkdir(parents=True,exist_ok=True)
@@ -117,10 +154,15 @@ def create_app(home=None, run_worker=True):
     app = FastAPI(title='Crush local API',lifespan=lifespan,docs_url=None,redoc_url=None)
     app.state.engine = engine
     app.state.token = token
+    # Added before local_only so host/origin/token rejection happens before reads.
+    app.add_middleware(RequestBodyLimit)
 
     @app.middleware('http')
     async def local_only(request: Request,call_next):
-        host = urlsplit('http://'+request.headers.get('host','')).hostname
+        try:
+            host = urlsplit('http://'+request.headers.get('host','')).hostname
+        except ValueError:
+            return JSONResponse({'error':'仅允许本机访问。'},status_code=403)
         if host not in {'localhost','127.0.0.1','::1','testserver'}:
             return JSONResponse({'error':'仅允许本机访问。'},status_code=403)
         origin = request.headers.get('origin')
@@ -131,9 +173,11 @@ def create_app(home=None, run_worker=True):
                 return JSONResponse({'error':'连接已更新，请刷新页面。'},status_code=403)
             try:
                 size = int(request.headers.get('content-length','0') or 0)
+                if size < 0:
+                    raise ValueError('negative length')
             except ValueError:
                 return JSONResponse({'error':'请求长度无效。'},status_code=400)
-            if size>20000:
+            if size>MAX_REQUEST_BYTES:
                 return JSONResponse({'error':'请求过大。'},status_code=413)
         response = await call_next(request)
         response.headers['X-Content-Type-Options']='nosniff'
@@ -146,6 +190,17 @@ def create_app(home=None, run_worker=True):
     @app.exception_handler(ValueError)
     async def invalid(request,exc):
         return JSONResponse({'error':str(exc)},status_code=400)
+
+    @app.exception_handler(RequestValidationError)
+    async def invalid_input(request, exc):
+        # Pydantic errors include raw input (including keys and private messages).
+        # Return only allowlisted field labels, never input/ctx or raw error text.
+        labels = {'base': '服务地址', 'model': '模型名称', 'key': 'API Key',
+                  'content': '消息内容', 'request_id': '消息标识', 'seconds': '时间间隔'}
+        fields = dict.fromkeys(labels[item['loc'][-1]] for item in exc.errors()
+                               if item.get('loc') and item['loc'][-1] in labels)
+        message = '、'.join(fields) + '格式或长度不正确。' if fields else '请求格式不正确，请检查输入后重试。'
+        return JSONResponse({'error': message}, status_code=422)
 
     @app.get('/api/bootstrap')
     def bootstrap():

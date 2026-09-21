@@ -1,7 +1,7 @@
 """Bounded structured generation. Offline demo is explicitly not a live model."""
 import json
 import re
-from urllib.request import Request, urlopen
+from urllib.request import Request, HTTPRedirectHandler, build_opener
 from urllib.parse import urlsplit
 from urllib.error import HTTPError, URLError
 
@@ -10,6 +10,16 @@ class ProviderError(ValueError):
     def __init__(self,message,code='invalid_output'):
         super().__init__(message)
         self.code=code
+
+
+class _NoRedirect(HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        # A provider redirect must never forward credentials or conversation data.
+        raise ProviderError('模型地址发生重定向，请在设置中填写最终 API 地址后重试。', 'redirect')
+
+
+def urlopen(request, timeout):
+    return build_opener(_NoRedirect()).open(request, timeout=timeout)
 
 
 def validate_base(base):

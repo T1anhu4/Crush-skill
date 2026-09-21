@@ -17,10 +17,21 @@ import os
 import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
-from urllib.request import Request, urlopen
+from urllib.request import Request, HTTPRedirectHandler, build_opener
+from urllib.error import URLError
 
 from .pragmatics_engine import interpret_message
 from .types import TurnAnalysis, clamp
+
+
+class _NoRedirect(HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        # Keep the standalone legacy Skill safe even without the v3 package.
+        raise URLError('Model redirects are disabled; configure the final API endpoint.')
+
+
+def urlopen(request, timeout):
+    return build_opener(_NoRedirect()).open(request, timeout=timeout)
 
 # ── Enhanced Local Analyzer ──────────────────────────────────────
 

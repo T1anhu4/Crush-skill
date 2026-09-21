@@ -43,6 +43,16 @@ def test_static_fallback_has_one_plain_line(motion, monkeypatch, kind):
     assert stream.getvalue() == 'Reading memory\n'
 
 
+def test_static_activity_wraps_and_strips_control_payloads(motion, monkeypatch):
+    monkeypatch.setenv('COLUMNS', '24')
+    stream = io.StringIO()
+    with motion.Spinner('读取记忆 e\u0301 ' * 10 + '\x1b]0;hidden title\x07done', stream=stream):
+        pass
+    output = stream.getvalue()
+    assert 'hidden title' not in output
+    assert all(motion.display_width(line) < 24 for line in output.splitlines())
+
+
 @pytest.mark.parametrize('error', [RuntimeError, KeyboardInterrupt])
 def test_cleanup_finishes_before_final_error_output(motion, monkeypatch, error):
     monkeypatch.setenv('TERM', 'xterm')
